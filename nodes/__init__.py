@@ -10,7 +10,7 @@ Modular organization of motion transfer nodes into logical groups:
 """
 
 # Import all node classes
-from .flow_nodes import RAFTFlowExtractor, FlowSRRefine, FlowToSTMap
+from .flow_nodes import RAFTFlowExtractor, BidirectionalFlowExtractor, FlowSRRefine, FlowToSTMap
 from .warp_nodes import TileWarp16K, TemporalConsistency, HiResWriter
 from .mesh_nodes import MeshBuilder2D, AdaptiveTessellate, MeshFromCoTracker, BarycentricWarp
 from .depth_nodes import DepthEstimator, ProxyReprojector
@@ -20,6 +20,7 @@ from .sequential_node import SequentialMotionTransfer
 NODE_CLASS_MAPPINGS = {
     # Flow nodes (Pipeline A)
     "RAFTFlowExtractor": RAFTFlowExtractor,
+    "BidirectionalFlowExtractor": BidirectionalFlowExtractor,
     "FlowSRRefine": FlowSRRefine,
     "FlowToSTMap": FlowToSTMap,
 
@@ -45,6 +46,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     # Flow nodes
     "RAFTFlowExtractor": "RAFT Flow Extractor",
+    "BidirectionalFlowExtractor": "Bidirectional Flow Extractor (v0.8+)",
     "FlowSRRefine": "Flow SR Refine",
     "FlowToSTMap": "Flow to STMap",
 
@@ -71,6 +73,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 __all__ = [
     # Classes
     "RAFTFlowExtractor",
+    "BidirectionalFlowExtractor",
     "FlowSRRefine",
     "FlowToSTMap",
     "TileWarp16K",
