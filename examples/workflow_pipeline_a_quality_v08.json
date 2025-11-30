@@ -1,0 +1,165 @@
+{
+  "workflow_name": "Pipeline A - Flow-Warp with v0.8 Quality Improvements",
+  "description": "Complete Pipeline A workflow demonstrating all v0.8 quality enhancements: raised cosine tile blending, color matching, adaptive temporal blending with scene cut detection, and joint bilateral flow upsampling with edge detection.",
+  "version": "0.8.0",
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "title": "Load Low-Res Video",
+      "params": {
+        "video_path": "input/ai_video_1080p.mp4"
+      },
+      "outputs": {
+        "images": "video_frames"
+      },
+      "tooltip": "Load AI-generated video (e.g., from Runway, Pika, Stable Video Diffusion). Typical resolution: 720p-1080p."
+    },
+    {
+      "id": 2,
+      "type": "RAFTFlowExtractor",
+      "title": "Extract Optical Flow (SEA-RAFT)",
+      "params": {
+        "model_name": "sea-raft-medium",
+        "raft_iters": 8
+      },
+      "inputs": {
+        "images": "video_frames"
+      },
+      "outputs": {
+        "flow": "flow_lowres",
+        "confidence": "flow_confidence"
+      },
+      "tooltip": "SEA-RAFT (ECCV 2024) - 2.3x faster than RAFT, 22% more accurate. Auto-downloads from HuggingFace on first use. Confidence map is used by adaptive temporal blending."
+    },
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "title": "Load High-Res Still",
+      "params": {
+        "image_path": "input/still_16k.png"
+      },
+      "outputs": {
+        "image": "still_hires"
+      },
+      "tooltip": "Load ultra-high-resolution still image (4K-32K). Motion from video will be transferred to this image."
+    },
+    {
+      "id": 4,
+      "type": "FlowSRRefine",
+      "title": "Upscale Flow with Edge-Aware Refinement (v0.8)",
+      "params": {
+        "target_width": 15360,
+        "target_height": 8640,
+        "upscale_method": "joint_bilateral",
+        "edge_detection": "canny",
+        "edge_threshold": 0.5,
+        "guided_filter_radius": 8,
+        "guided_filter_eps": 0.001
+      },
+      "inputs": {
+        "flow": "flow_lowres",
+        "guide_image": "still_hires"
+      },
+      "outputs": {
+        "flow_upscaled": "flow_hires"
+      },
+      "tooltip": "NEW v0.8: Joint bilateral upsampling prevents flow bleeding across edges. Canny edge detection preserves sharp boundaries. Much better than legacy guided filtering."
+    },
+    {
+      "id": 5,
+      "type": "FlowToSTMap",
+      "title": "Convert Flow to STMap",
+      "params": {},
+      "inputs": {
+        "flow": "flow_hires"
+      },
+      "outputs": {
+        "stmap": "stmap_sequence"
+      },
+      "tooltip": "Convert accumulated flow vectors to normalized STMap coordinates for warping."
+    },
+    {
+      "id": 6,
+      "type": "TileWarp16K",
+      "title": "Warp with Raised Cosine Blending (v0.8)",
+      "params": {
+        "tile_size": 2048,
+        "overlap": 128,
+        "interpolation": "cubic",
+        "blend_mode": "raised_cosine",
+        "color_match": true
+      },
+      "inputs": {
+        "still_image": "still_hires",
+        "stmap": "stmap_sequence"
+      },
+      "outputs": {
+        "warped_sequence": "warped_frames"
+      },
+      "tooltip": "NEW v0.8: Raised cosine (Hann window) eliminates visible seams. Color matching fixes exposure discontinuities. Set blend_mode='linear' for legacy behavior."
+    },
+    {
+      "id": 7,
+      "type": "TemporalConsistency",
+      "title": "Adaptive Temporal Stabilization (v0.8)",
+      "params": {
+        "blend_strength": 0.3,
+        "blend_mode": "adaptive",
+        "scene_cut_detection": true,
+        "scene_cut_threshold": 0.3,
+        "motion_threshold": 20.0
+      },
+      "inputs": {
+        "frames": "warped_frames",
+        "flow": "flow_hires",
+        "confidence": "flow_confidence"
+      },
+      "outputs": {
+        "stabilized": "final_sequence"
+      },
+      "tooltip": "NEW v0.8: Adaptive blending uses confidence + motion magnitude. Prevents ghosting in fast motion, reduces flicker in slow motion. Scene cut detection prevents blending across shot changes."
+    },
+    {
+      "id": 8,
+      "type": "HiResWriter",
+      "title": "Export Final Sequence",
+      "params": {
+        "output_path": "output/motion_transfer_v08/frame",
+        "format": "png",
+        "start_frame": 0
+      },
+      "inputs": {
+        "images": "final_sequence"
+      },
+      "tooltip": "Write 16K frames to disk. Use FFmpeg to encode: ffmpeg -framerate 24 -i frame_%04d.png -c:v libx264 -preset slow -crf 18 output.mp4"
+    }
+  ],
+  "recommended_settings": {
+    "GPU_VRAM": "24GB for 16K (use tile_size=1024 for 12GB GPU)",
+    "processing_time": "~6 min for 120 frames @ 16K (RTX 4090)",
+    "quality_improvements": [
+      "Raised cosine tile blending eliminates seams",
+      "Color matching fixes exposure discontinuities",
+      "Joint bilateral flow upsampling prevents edge bleeding",
+      "Canny edge detection preserves sharp boundaries",
+      "Adaptive temporal blending reduces flicker without ghosting",
+      "Scene cut detection prevents cross-scene artifacts"
+    ]
+  },
+  "backward_compatibility": {
+    "note": "To match v0.7 output, set:",
+    "TileWarp16K": {
+      "blend_mode": "linear",
+      "color_match": false
+    },
+    "FlowSRRefine": {
+      "upscale_method": "guided_filter",
+      "edge_detection": "none"
+    },
+    "TemporalConsistency": {
+      "blend_mode": "fixed",
+      "scene_cut_detection": false
+    }
+  }
+}
