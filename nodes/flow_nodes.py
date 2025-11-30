@@ -54,6 +54,16 @@ class RAFTFlowExtractor:
                     "default": "raft-sintel",
                     "tooltip": "Optical flow model. RAFT: original (2020), requires manual model download. SEA-RAFT: newer (ECCV 2024), 2.3x faster with 22% better accuracy, auto-downloads from HuggingFace. Recommended: sea-raft-medium for best speed/quality balance."
                 }),
+                "handle_large_motion": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable multi-frame flow accumulation for large motion (v0.8+ Phase 3). Automatically subdivides frames when flow exceeds max_displacement threshold. Slower but handles fast motion better."
+                }),
+                "max_displacement": ("INT", {
+                    "default": 128,
+                    "min": 32,
+                    "max": 512,
+                    "tooltip": "Maximum flow magnitude (pixels) before subdivision (Phase 3). RAFT/SEA-RAFT have effective max ~256px. If motion exceeds this, frames are interpolated and flow accumulated. 128 is recommended."
+                }),
             }
         }
 
@@ -62,13 +72,15 @@ class RAFTFlowExtractor:
     FUNCTION = "extract_flow"
     CATEGORY = "MotionTransfer/Flow"
 
-    def extract_flow(self, images, raft_iters, model_name):
+    def extract_flow(self, images, raft_iters, model_name, handle_large_motion=False, max_displacement=128):
         """Extract optical flow between consecutive frame pairs.
 
         Args:
             images: Tensor [B, H, W, C] in range [0, 1]
             raft_iters: Number of refinement iterations
             model_name: Model variant to use (RAFT or SEA-RAFT)
+            handle_large_motion: Enable multi-frame accumulation for large motion
+            max_displacement: Maximum flow magnitude before subdivision
 
         Returns:
             flow: Tensor [B-1, H, W, 2] containing (u, v) flow vectors
@@ -132,6 +144,25 @@ class RAFTFlowExtractor:
                     flow_mag = torch.sqrt(flow_up[:, 0:1]**2 + flow_up[:, 1:2]**2)
                     conf = torch.exp(-flow_mag / 10.0)
 
+                # Check for large motion if handling is enabled
+                if handle_large_motion:
+                    flow_mag = torch.sqrt(flow_up[:, 0:1]**2 + flow_up[:, 1:2]**2)
+                    max_motion = flow_mag.max().item()
+
+                    if max_motion > max_displacement:
+                        # Need subdivision - compute multi-frame flow
+                        print(f"[RAFTFlowExtractor] Frame {i}: Large motion detected ({max_motion:.1f}px > {max_displacement}px), using multi-frame accumulation")
+
+                        # Interpolate frames and accumulate flow
+                        accumulated_flow, accumulated_conf = self._multi_frame_flow(
+                            images[i:i+1], images[i+1:i+2], model, model_type,
+                            raft_iters, max_displacement, device
+                        )
+
+                        flows.append(accumulated_flow)
+                        confidences.append(accumulated_conf)
+                        continue
+
                 flows.append(flow_up[0].permute(1, 2, 0).cpu())  # [H, W, 2]
                 confidences.append(conf[0].permute(1, 2, 0).cpu())  # [H, W, 1]
 
@@ -160,6 +191,171 @@ class RAFTFlowExtractor:
             cls._model_type = model_type
 
         return cls._model, cls._model_type
+
+    def _multi_frame_flow(self, frame_a, frame_b, model, model_type, raft_iters, max_displacement, device):
+        """Compute flow with multi-frame accumulation for large motion.
+
+        Args:
+            frame_a: [1, C, H, W] first frame
+            frame_b: [1, C, H, W] second frame
+            model: RAFT or SEA-RAFT model
+            model_type: 'raft' or 'searaft'
+            raft_iters: Refinement iterations
+            max_displacement: Maximum flow magnitude before subdivision
+            device: torch device
+
+        Returns:
+            accumulated_flow: [H, W, 2] total flow from frame_a to frame_b
+            accumulated_conf: [H, W, 1] confidence for accumulated flow
+        """
+        # Estimate required subdivisions
+        with torch.no_grad():
+            # Quick initial flow estimate with few iterations
+            if model_type == 'searaft':
+                _, initial_flow, _ = model(frame_a * 255.0, frame_b * 255.0, iters=4, test_mode=True)
+            else:
+                _, initial_flow = model(frame_a * 255.0, frame_b * 255.0, iters=4, test_mode=True)
+
+            max_motion = torch.sqrt(initial_flow[:, 0:1]**2 + initial_flow[:, 1:2]**2).max().item()
+            n_subdivisions = int(np.ceil(max_motion / max_displacement))
+            n_subdivisions = min(n_subdivisions, 4)  # Cap at 4 subdivisions
+
+            print(f"  Subdividing into {n_subdivisions} intermediate frames")
+
+            # Interpolate intermediate frames
+            interp_frames = self._interpolate_frames(frame_a, frame_b, n_subdivisions, device)
+
+            # Compute flow between each pair
+            sub_flows = []
+            sub_confs = []
+
+            for j in range(len(interp_frames) - 1):
+                img1 = interp_frames[j] * 255.0
+                img2 = interp_frames[j+1] * 255.0
+
+                # Pad to multiple of 8
+                from torch.nn.functional import pad
+                h, w = img1.shape[2:]
+                pad_h = (8 - h % 8) % 8
+                pad_w = (8 - w % 8) % 8
+                if pad_h > 0 or pad_w > 0:
+                    img1 = pad(img1, (0, pad_w, 0, pad_h), mode='replicate')
+                    img2 = pad(img2, (0, pad_w, 0, pad_h), mode='replicate')
+
+                # Compute flow
+                if model_type == 'searaft':
+                    _, flow_up, uncertainty = model(img1, img2, iters=raft_iters, test_mode=True)
+                else:
+                    _, flow_up = model(img1, img2, iters=raft_iters, test_mode=True)
+                    uncertainty = None
+
+                # Remove padding
+                if pad_h > 0 or pad_w > 0:
+                    flow_up = flow_up[:, :, :h, :w]
+                    if uncertainty is not None:
+                        uncertainty = uncertainty[:, :, :h, :w]
+
+                # Compute confidence
+                if model_type == 'searaft' and uncertainty is not None:
+                    conf = 1.0 - torch.clamp(uncertainty, 0, 1)
+                else:
+                    flow_mag = torch.sqrt(flow_up[:, 0:1]**2 + flow_up[:, 1:2]**2)
+                    conf = torch.exp(-flow_mag / 10.0)
+
+                sub_flows.append(flow_up)
+                sub_confs.append(conf)
+
+            # Accumulate flows
+            total_flow = self._accumulate_flows(sub_flows, device)
+
+            # Average confidences (conservative)
+            avg_conf = torch.stack(sub_confs, dim=0).mean(dim=0)
+
+            return (total_flow[0].permute(1, 2, 0).cpu(),
+                    avg_conf[0].permute(1, 2, 0).cpu())
+
+    def _interpolate_frames(self, frame_a, frame_b, n_intermediate, device):
+        """Generate intermediate frames using linear interpolation.
+
+        Args:
+            frame_a: [1, C, H, W] first frame
+            frame_b: [1, C, H, W] second frame
+            n_intermediate: Number of intermediate frames to create
+            device: torch device
+
+        Returns:
+            frames: List of [1, C, H, W] tensors including endpoints
+        """
+        frames = [frame_a]
+        for i in range(1, n_intermediate):
+            t = i / n_intermediate
+            interp = frame_a * (1 - t) + frame_b * t
+            frames.append(interp)
+        frames.append(frame_b)
+        return frames
+
+    def _accumulate_flows(self, flows, device):
+        """Accumulate multiple flow fields into single total displacement.
+
+        Args:
+            flows: List of [1, 2, H, W] flow tensors
+            device: torch device
+
+        Returns:
+            total_flow: [1, 2, H, W] accumulated flow
+        """
+        if len(flows) == 1:
+            return flows[0]
+
+        # Start with first flow
+        total = flows[0].clone()
+
+        # Accumulate remaining flows
+        for i in range(1, len(flows)):
+            # Warp next flow by accumulated flow
+            warped_flow = self._warp_flow_field(flows[i], total, device)
+            # Add to accumulator
+            total = total + warped_flow
+
+        return total
+
+    def _warp_flow_field(self, flow, displacement, device):
+        """Warp a flow field using a displacement field.
+
+        Args:
+            flow: [1, 2, H, W] flow field to warp
+            displacement: [1, 2, H, W] displacement field
+            device: torch device
+
+        Returns:
+            warped_flow: [1, 2, H, W] warped flow
+        """
+        _, _, h, w = flow.shape
+
+        # Create sampling grid
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(h, device=device, dtype=torch.float32),
+            torch.arange(w, device=device, dtype=torch.float32),
+            indexing='ij'
+        )
+
+        # Apply displacement
+        sample_x = grid_x + displacement[0, 0, :, :]
+        sample_y = grid_y + displacement[0, 1, :, :]
+
+        # Normalize to [-1, 1] for grid_sample
+        sample_x = 2.0 * sample_x / (w - 1) - 1.0
+        sample_y = 2.0 * sample_y / (h - 1) - 1.0
+
+        # Stack into grid [1, H, W, 2]
+        grid = torch.stack([sample_x, sample_y], dim=-1).unsqueeze(0)
+
+        # Warp using grid_sample
+        warped = torch.nn.functional.grid_sample(
+            flow, grid, mode='bilinear', padding_mode='border', align_corners=True
+        )
+
+        return warped
 
 
 # ------------------------------------------------------
