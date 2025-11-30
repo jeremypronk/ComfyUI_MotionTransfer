@@ -41,12 +41,26 @@ Transfer motion from low-resolution AI-generated videos to ultra-high-resolution
 - Prevents background motion leaking into foreground objects
 - Multi-scale edge detection for robust boundary handling
 
+### Phase 3 Improvements (Latest)
+
+**7. Multi-Frame Flow Accumulation for Large Motion (RAFTFlowExtractor)**
+- Automatically detects when flow magnitude exceeds threshold
+- Subdivides frame pairs with linear interpolation
+- Computes flow between intermediate frames
+- Accumulates flows with proper composition
+- New parameters:
+  - `handle_large_motion` = False (default, enable for fast motion)
+  - `max_displacement` = 128 (threshold for subdivision)
+- Best for: Fast camera pans, quick hand movements, low frame rate sources
+- Processing time: 2-4x slower when subdivision occurs (only on affected frames)
+
 ### Backward Compatibility
 
 All new features are **fully backward compatible**:
 - Existing workflows continue to work unchanged
 - New parameters have sensible defaults that match legacy behavior
 - Set `blend_mode="linear"` and `upscale_method="guided_filter"` for v0.7 behavior
+- Phase 3 features are opt-in (disabled by default)
 
 ## Features
 
