@@ -2,6 +2,66 @@
 
 Transfer motion from low-resolution AI-generated videos to ultra-high-resolution still images (up to 16K+).
 
+## What's New in v0.8 - Quality Improvements 🎉
+
+**Major quality enhancements for professional-grade output:**
+
+### Phase 1 & 2 Improvements (Implemented)
+
+**1. Raised Cosine Tile Blending**
+- Replaces linear blending with Hann window (raised cosine) for smoother tile transitions
+- Eliminates visible seams at tile boundaries on uniform surfaces
+- Reduces banding artifacts in gradient regions
+
+**2. Color Matching in Tile Overlaps**
+- Automatically matches color statistics between adjacent tiles
+- Eliminates exposure discontinuities at tile boundaries
+- Adaptive histogram matching for seamless stitching
+
+**3. Adaptive Temporal Blending**
+- Confidence-weighted blending reduces flicker without ghosting
+- Motion-magnitude modulation prevents ghosting in fast-motion areas
+- Scene cut detection prevents blending across shot changes
+- Per-pixel adaptive blend strength for optimal quality
+
+**4. Bidirectional Flow with Occlusion Detection (New Node!)**
+- `BidirectionalFlowExtractor` - computes forward and backward flow
+- Consistency-based occlusion detection identifies unreliable regions
+- Significantly more accurate confidence maps than single-direction flow
+- Adaptive threshold based on flow magnitude
+
+**5. Joint Bilateral Flow Upsampling**
+- Better edge preservation than guided filtering
+- Prevents flow bleeding across sharp boundaries
+- Reduces halo artifacts around high-contrast edges
+- Canny/Sobel edge detection for explicit edge constraints
+
+**6. Edge-Aware Flow Refinement**
+- Edge mask generation preserves flow discontinuities
+- Prevents background motion leaking into foreground objects
+- Multi-scale edge detection for robust boundary handling
+
+### Phase 3 Improvements (Latest)
+
+**7. Multi-Frame Flow Accumulation for Large Motion (RAFTFlowExtractor)**
+- Automatically detects when flow magnitude exceeds threshold
+- Subdivides frame pairs with linear interpolation
+- Computes flow between intermediate frames
+- Accumulates flows with proper composition
+- New parameters:
+  - `handle_large_motion` = False (default, enable for fast motion)
+  - `max_displacement` = 128 (threshold for subdivision)
+- Best for: Fast camera pans, quick hand movements, low frame rate sources
+- Processing time: 2-4x slower when subdivision occurs (only on affected frames)
+
+### Backward Compatibility
+
+All new features are **fully backward compatible**:
+- Existing workflows continue to work unchanged
+- New parameters have sensible defaults that match legacy behavior
+- Set `blend_mode="linear"` and `upscale_method="guided_filter"` for v0.7 behavior
+- Phase 3 features are opt-in (disabled by default)
+
 ## Features
 
 This node pack provides three complementary pipelines for motion transfer:

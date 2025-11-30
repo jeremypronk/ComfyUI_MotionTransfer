@@ -1,0 +1,188 @@
+{
+  "workflow_name": "Bidirectional Flow with Occlusion Detection (v0.8)",
+  "description": "Advanced workflow using BidirectionalFlowExtractor for superior confidence maps and occlusion detection. Best for scenes with complex occlusions (faces, hands, overlapping objects).",
+  "version": "0.8.0",
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "title": "Load Low-Res Video",
+      "params": {
+        "video_path": "input/ai_video_1080p.mp4"
+      },
+      "outputs": {
+        "images": "video_frames"
+      }
+    },
+    {
+      "id": 2,
+      "type": "BidirectionalFlowExtractor",
+      "title": "Extract Bidirectional Flow (v0.8 NEW!)",
+      "params": {
+        "model_name": "sea-raft-medium",
+        "raft_iters": 8,
+        "consistency_threshold": 1.0,
+        "adaptive_threshold": true
+      },
+      "inputs": {
+        "images": "video_frames"
+      },
+      "outputs": {
+        "flow_forward": "flow_fwd",
+        "flow_backward": "flow_bwd",
+        "confidence": "flow_confidence_bidirectional",
+        "occlusion_mask": "occlusion_mask",
+        "consistency_error": "consistency_error_vis"
+      },
+      "tooltip": "NEW v0.8: Computes forward AND backward flow, checks consistency to detect occlusions. Much more accurate confidence than single-direction flow. ~2x processing time but worth it for quality."
+    },
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "title": "Load High-Res Still",
+      "params": {
+        "image_path": "input/still_16k.png"
+      },
+      "outputs": {
+        "image": "still_hires"
+      }
+    },
+    {
+      "id": 4,
+      "type": "FlowSRRefine",
+      "title": "Upscale Flow with Edge Detection",
+      "params": {
+        "target_width": 15360,
+        "target_height": 8640,
+        "upscale_method": "joint_bilateral",
+        "edge_detection": "canny",
+        "edge_threshold": 0.5,
+        "guided_filter_radius": 8,
+        "guided_filter_eps": 0.001
+      },
+      "inputs": {
+        "flow": "flow_fwd",
+        "guide_image": "still_hires"
+      },
+      "outputs": {
+        "flow_upscaled": "flow_hires"
+      }
+    },
+    {
+      "id": 5,
+      "type": "FlowToSTMap",
+      "title": "Convert to STMap",
+      "params": {},
+      "inputs": {
+        "flow": "flow_hires"
+      },
+      "outputs": {
+        "stmap": "stmap_sequence"
+      }
+    },
+    {
+      "id": 6,
+      "type": "TileWarp16K",
+      "title": "Warp with Quality Improvements",
+      "params": {
+        "tile_size": 2048,
+        "overlap": 128,
+        "interpolation": "cubic",
+        "blend_mode": "raised_cosine",
+        "color_match": true
+      },
+      "inputs": {
+        "still_image": "still_hires",
+        "stmap": "stmap_sequence"
+      },
+      "outputs": {
+        "warped_sequence": "warped_frames"
+      }
+    },
+    {
+      "id": 7,
+      "type": "TemporalConsistency",
+      "title": "Adaptive Temporal with Bidirectional Confidence",
+      "params": {
+        "blend_strength": 0.3,
+        "blend_mode": "adaptive",
+        "scene_cut_detection": true,
+        "scene_cut_threshold": 0.3,
+        "motion_threshold": 20.0
+      },
+      "inputs": {
+        "frames": "warped_frames",
+        "flow": "flow_hires",
+        "confidence": "flow_confidence_bidirectional"
+      },
+      "outputs": {
+        "stabilized": "final_sequence"
+      },
+      "tooltip": "Using bidirectional confidence (from node 2) gives much better adaptive blending. Regions with occlusions get more temporal averaging, confident regions stay sharp."
+    },
+    {
+      "id": 8,
+      "type": "HiResWriter",
+      "title": "Export Final Sequence",
+      "params": {
+        "output_path": "output/bidirectional_v08/frame",
+        "format": "png",
+        "start_frame": 0
+      },
+      "inputs": {
+        "images": "final_sequence"
+      }
+    },
+    {
+      "id": 9,
+      "type": "HiResWriter",
+      "title": "Export Occlusion Mask (Optional Debug)",
+      "params": {
+        "output_path": "output/bidirectional_v08/occlusion",
+        "format": "png",
+        "start_frame": 0
+      },
+      "inputs": {
+        "images": "occlusion_mask"
+      },
+      "tooltip": "Optional: Export occlusion mask for debugging. White = occluded/unreliable, Black = confident flow."
+    },
+    {
+      "id": 10,
+      "type": "HiResWriter",
+      "title": "Export Consistency Error (Optional Debug)",
+      "params": {
+        "output_path": "output/bidirectional_v08/consistency",
+        "format": "png",
+        "start_frame": 0
+      },
+      "inputs": {
+        "images": "consistency_error_vis"
+      },
+      "tooltip": "Optional: Export consistency error visualization. Brighter = higher error (likely occlusion or flow failure)."
+    }
+  ],
+  "use_cases": {
+    "best_for": [
+      "Scenes with faces (eyes, mouth occlusions)",
+      "Hand motion (finger occlusions)",
+      "Overlapping objects",
+      "Complex organic motion",
+      "Anything where standard flow confidence is unreliable"
+    ],
+    "processing_time": "~2x single-direction flow (runs forward + backward)",
+    "quality_gain": "Significantly better confidence maps → less flicker in uncertain regions"
+  },
+  "comparison_to_standard_flow": {
+    "RAFTFlowExtractor": {
+      "confidence_method": "Heuristic (flow magnitude or SEA-RAFT uncertainty)",
+      "occlusion_handling": "None",
+      "processing_time": "Baseline (1x)"
+    },
+    "BidirectionalFlowExtractor": {
+      "confidence_method": "Forward-backward consistency (physics-based)",
+      "occlusion_handling": "Explicit detection with adaptive threshold",
+      "processing_time": "~2x baseline (worth it for quality)"
+    }
+  }
+}

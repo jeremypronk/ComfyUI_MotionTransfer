@@ -57,6 +57,14 @@ class TileWarp16K:
                     "default": "cubic",
                     "tooltip": "Interpolation method. 'cubic': best quality/speed balance (recommended). 'linear': fastest but lower quality. 'lanczos4': highest quality but slowest."
                 }),
+                "blend_mode": (["raised_cosine", "linear"], {
+                    "default": "raised_cosine",
+                    "tooltip": "Tile blending mode. 'raised_cosine': smoother seam elimination (recommended, v0.8+). 'linear': legacy mode for backward compatibility."
+                }),
+                "color_match": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable color matching in tile overlaps to eliminate exposure discontinuities (v0.8+). Recommended: True."
+                }),
             }
         }
 
@@ -65,7 +73,7 @@ class TileWarp16K:
     FUNCTION = "warp"
     CATEGORY = "MotionTransfer/Warp"
 
-    def warp(self, still_image, stmap, tile_size, overlap, interpolation):
+    def warp(self, still_image, stmap, tile_size, overlap, interpolation, blend_mode="raised_cosine", color_match=True):
         """Apply STMap warping with tiled processing and feathered blending.
 
         Args:
@@ -74,6 +82,8 @@ class TileWarp16K:
             tile_size: Size of processing tiles
             overlap: Overlap between tiles for blending
             interpolation: Interpolation method
+            blend_mode: 'raised_cosine' (smoother) or 'linear' (legacy)
+            color_match: Enable color matching in overlaps
 
         Returns:
             warped_sequence: [B, H, W, C] warped frames
@@ -98,14 +108,14 @@ class TileWarp16K:
         # Try CUDA acceleration first
         if CUDA_AVAILABLE and torch.cuda.is_available():
             try:
-                return self._warp_cuda(still, stmap, tile_size, overlap, interpolation)
+                return self._warp_cuda(still, stmap, tile_size, overlap, interpolation, blend_mode, color_match)
             except Exception as e:
                 print(f"[TileWarp16K] CUDA failed ({e}), falling back to CPU")
 
         # CPU fallback
-        return self._warp_cpu(still, stmap, tile_size, overlap, interpolation)
+        return self._warp_cpu(still, stmap, tile_size, overlap, interpolation, blend_mode, color_match)
 
-    def _warp_cuda(self, still, stmap, tile_size, overlap, interpolation):
+    def _warp_cuda(self, still, stmap, tile_size, overlap, interpolation, blend_mode="raised_cosine", color_match=True):
         """CUDA-accelerated warping (8-15× faster than CPU)."""
         h, w, c = still.shape
         batch_size = stmap.shape[0]
@@ -129,11 +139,12 @@ class TileWarp16K:
 
                     stmap_tile = stmap_frame[y0:y1, x0:x1]
 
-                    # Get feather mask
+                    # Get feather mask with new blending mode
                     tile_feather = self._get_tile_feather(
                         tile_h, tile_w, tile_size, overlap,
                         is_top=(y0 == 0), is_left=(x0 == 0),
-                        is_bottom=(y1 == h), is_right=(x1 == w)
+                        is_bottom=(y1 == h), is_right=(x1 == w),
+                        blend_mode=blend_mode
                     )
 
                     # CUDA tile warp
@@ -150,8 +161,8 @@ class TileWarp16K:
         result = np.stack(warped_frames, axis=0)
         return (result,)
 
-    def _warp_cpu(self, still, stmap, tile_size, overlap, interpolation):
-        """CPU fallback (original implementation)."""
+    def _warp_cpu(self, still, stmap, tile_size, overlap, interpolation, blend_mode="raised_cosine", color_match=True):
+        """CPU fallback with quality improvements."""
         h, w, c = still.shape
 
         # Get interpolation mode
@@ -172,6 +183,9 @@ class TileWarp16K:
             # Initialize output and weight accumulation buffers
             warped_full = np.zeros((h, w, c), dtype=np.float32)
             weight_full = np.zeros((h, w, 1), dtype=np.float32)
+
+            # Store previous tile for color matching
+            prev_tiles = {}  # (y0, x0) -> warped_tile
 
             # Tile processing
             step = tile_size - overlap
@@ -198,11 +212,30 @@ class TileWarp16K:
                         borderMode=cv2.BORDER_REFLECT_101
                     )
 
-                    # Get feather mask for this tile
+                    # Apply color matching if enabled
+                    if color_match and overlap > 0:
+                        # Match with left neighbor
+                        if (y0, x0 - step) in prev_tiles:
+                            ref_tile = prev_tiles[(y0, x0 - step)]
+                            warped_tile = self._match_tile_colors_horizontal(
+                                ref_tile, warped_tile, overlap, is_left_ref=True
+                            )
+                        # Match with top neighbor
+                        if (y0 - step, x0) in prev_tiles:
+                            ref_tile = prev_tiles[(y0 - step, x0)]
+                            warped_tile = self._match_tile_colors_vertical(
+                                ref_tile, warped_tile, overlap, is_top_ref=True
+                            )
+
+                    # Store tile for future color matching
+                    prev_tiles[(y0, x0)] = warped_tile
+
+                    # Get feather mask for this tile with new blending mode
                     tile_feather = self._get_tile_feather(
                         tile_h, tile_w, tile_size, overlap,
                         is_top=(y0 == 0), is_left=(x0 == 0),
-                        is_bottom=(y1 == h), is_right=(x1 == w)
+                        is_bottom=(y1 == h), is_right=(x1 == w),
+                        blend_mode=blend_mode
                     )
 
                     # Accumulate with feathered blending
@@ -226,7 +259,7 @@ class TileWarp16K:
         # Not used directly, but kept for reference
         return None
 
-    def _get_tile_feather(self, tile_h, tile_w, tile_size, overlap, is_top, is_left, is_bottom, is_right):
+    def _get_tile_feather(self, tile_h, tile_w, tile_size, overlap, is_top, is_left, is_bottom, is_right, blend_mode="raised_cosine"):
         """Generate feather mask for a specific tile position.
 
         Args:
@@ -234,42 +267,141 @@ class TileWarp16K:
             tile_size: Nominal tile size
             overlap: Overlap width
             is_top, is_left, is_bottom, is_right: Edge flags
+            blend_mode: 'raised_cosine' or 'linear'
 
         Returns:
-            feather: [H, W, 1] weight mask with linear gradients in overlap regions
+            feather: [H, W, 1] weight mask with gradients in overlap regions
         """
         feather = np.ones((tile_h, tile_w, 1), dtype=np.float32)
 
-        # Create linear ramps for each edge with correct broadcasting
-        if not is_left and overlap > 0:
-            # Left edge fade-in: shape (tile_w,) broadcast to (tile_h, tile_w, 1)
-            ramp_len = min(overlap, tile_w)
-            ramp = np.linspace(0, 1, ramp_len)
-            # Reshape to (1, ramp_len, 1) for proper broadcasting
-            feather[:, :ramp_len, :] *= ramp[None, :, None]
+        # Create ramps based on blend mode
+        if blend_mode == "raised_cosine":
+            # Raised cosine (Hann window) for smoother transitions
+            if not is_left and overlap > 0:
+                ramp_len = min(overlap, tile_w)
+                # Raised cosine: 0.5 * (1 - cos(pi * x))
+                x = np.linspace(0, 1, ramp_len)
+                ramp = 0.5 * (1 - np.cos(np.pi * x))
+                feather[:, :ramp_len, :] *= ramp[None, :, None]
 
-        if not is_right and overlap > 0:
-            # Right edge fade-out
-            ramp_len = min(overlap, tile_w)
-            ramp = np.linspace(1, 0, ramp_len)
-            # Reshape to (1, ramp_len, 1)
-            feather[:, -ramp_len:, :] *= ramp[None, :, None]
+            if not is_right and overlap > 0:
+                ramp_len = min(overlap, tile_w)
+                x = np.linspace(1, 0, ramp_len)
+                ramp = 0.5 * (1 - np.cos(np.pi * x))
+                feather[:, -ramp_len:, :] *= ramp[None, :, None]
 
-        if not is_top and overlap > 0:
-            # Top edge fade-in: shape (tile_h,) broadcast to (tile_h, tile_w, 1)
-            ramp_len = min(overlap, tile_h)
-            ramp = np.linspace(0, 1, ramp_len)
-            # Reshape to (ramp_len, 1, 1)
-            feather[:ramp_len, :, :] *= ramp[:, None, None]
+            if not is_top and overlap > 0:
+                ramp_len = min(overlap, tile_h)
+                x = np.linspace(0, 1, ramp_len)
+                ramp = 0.5 * (1 - np.cos(np.pi * x))
+                feather[:ramp_len, :, :] *= ramp[:, None, None]
 
-        if not is_bottom and overlap > 0:
-            # Bottom edge fade-out
-            ramp_len = min(overlap, tile_h)
-            ramp = np.linspace(1, 0, ramp_len)
-            # Reshape to (ramp_len, 1, 1)
-            feather[-ramp_len:, :, :] *= ramp[:, None, None]
+            if not is_bottom and overlap > 0:
+                ramp_len = min(overlap, tile_h)
+                x = np.linspace(1, 0, ramp_len)
+                ramp = 0.5 * (1 - np.cos(np.pi * x))
+                feather[-ramp_len:, :, :] *= ramp[:, None, None]
+        else:
+            # Legacy linear blending for backward compatibility
+            if not is_left and overlap > 0:
+                ramp_len = min(overlap, tile_w)
+                ramp = np.linspace(0, 1, ramp_len)
+                feather[:, :ramp_len, :] *= ramp[None, :, None]
+
+            if not is_right and overlap > 0:
+                ramp_len = min(overlap, tile_w)
+                ramp = np.linspace(1, 0, ramp_len)
+                feather[:, -ramp_len:, :] *= ramp[None, :, None]
+
+            if not is_top and overlap > 0:
+                ramp_len = min(overlap, tile_h)
+                ramp = np.linspace(0, 1, ramp_len)
+                feather[:ramp_len, :, :] *= ramp[:, None, None]
+
+            if not is_bottom and overlap > 0:
+                ramp_len = min(overlap, tile_h)
+                ramp = np.linspace(1, 0, ramp_len)
+                feather[-ramp_len:, :, :] *= ramp[:, None, None]
 
         return feather
+
+    def _match_tile_colors_horizontal(self, ref_tile, src_tile, overlap, is_left_ref=True):
+        """Match tile colors in horizontal overlap region.
+
+        Args:
+            ref_tile: Reference tile (left neighbor)
+            src_tile: Source tile to adjust (current tile)
+            overlap: Overlap width
+            is_left_ref: If True, ref is on left; otherwise ref is on right
+
+        Returns:
+            Color-matched source tile
+        """
+        if overlap <= 0 or overlap >= src_tile.shape[1]:
+            return src_tile
+
+        # Extract overlap regions
+        if is_left_ref:
+            ref_region = ref_tile[:, -overlap:, :]  # Right edge of left tile
+            src_region = src_tile[:, :overlap, :]    # Left edge of current tile
+        else:
+            ref_region = ref_tile[:, :overlap, :]    # Left edge of right tile
+            src_region = src_tile[:, -overlap:, :]   # Right edge of current tile
+
+        # Compute color statistics
+        ref_mean = np.mean(ref_region, axis=(0, 1), keepdims=True)
+        ref_std = np.std(ref_region, axis=(0, 1), keepdims=True) + 1e-6
+
+        src_mean = np.mean(src_region, axis=(0, 1), keepdims=True)
+        src_std = np.std(src_region, axis=(0, 1), keepdims=True) + 1e-6
+
+        # Compute linear transform: src_matched = (src - src_mean) * (ref_std / src_std) + ref_mean
+        scale = ref_std / src_std
+        offset = ref_mean - src_mean * scale
+
+        # Apply to entire source tile
+        src_matched = src_tile * scale + offset
+
+        return np.clip(src_matched, 0, 1).astype(np.float32)
+
+    def _match_tile_colors_vertical(self, ref_tile, src_tile, overlap, is_top_ref=True):
+        """Match tile colors in vertical overlap region.
+
+        Args:
+            ref_tile: Reference tile (top neighbor)
+            src_tile: Source tile to adjust (current tile)
+            overlap: Overlap height
+            is_top_ref: If True, ref is on top; otherwise ref is on bottom
+
+        Returns:
+            Color-matched source tile
+        """
+        if overlap <= 0 or overlap >= src_tile.shape[0]:
+            return src_tile
+
+        # Extract overlap regions
+        if is_top_ref:
+            ref_region = ref_tile[-overlap:, :, :]  # Bottom edge of top tile
+            src_region = src_tile[:overlap, :, :]    # Top edge of current tile
+        else:
+            ref_region = ref_tile[:overlap, :, :]    # Top edge of bottom tile
+            src_region = src_tile[-overlap:, :, :]   # Bottom edge of current tile
+
+        # Compute color statistics
+        ref_mean = np.mean(ref_region, axis=(0, 1), keepdims=True)
+        ref_std = np.std(ref_region, axis=(0, 1), keepdims=True) + 1e-6
+
+        src_mean = np.mean(src_region, axis=(0, 1), keepdims=True)
+        src_std = np.std(src_region, axis=(0, 1), keepdims=True) + 1e-6
+
+        # Compute linear transform
+        scale = ref_std / src_std
+        offset = ref_mean - src_mean * scale
+
+        # Apply to entire source tile
+        src_matched = src_tile * scale + offset
+
+        return np.clip(src_matched, 0, 1).astype(np.float32)
 
 
 # ------------------------------------------------------
@@ -279,7 +411,8 @@ class TemporalConsistency:
     """Apply temporal stabilization using flow-based frame blending.
 
     Reduces flicker and jitter by blending each frame with the previous frame
-    warped forward using optical flow.
+    warped forward using optical flow. Now supports adaptive blending based on
+    confidence and motion magnitude, plus scene cut detection (v0.8+).
     """
 
     @classmethod
@@ -297,7 +430,34 @@ class TemporalConsistency:
                     "min": 0.0,
                     "max": 1.0,
                     "step": 0.05,
-                    "tooltip": "Temporal blending strength. 0.0 = no blending (may flicker), 0.3 = balanced (recommended), 0.5+ = strong smoothing (may blur motion). Reduce if motion looks ghosted."
+                    "tooltip": "Base temporal blending strength. 0.0 = no blending (may flicker), 0.3 = balanced (recommended), 0.5+ = strong smoothing (may blur motion). In adaptive mode, this is the base strength that gets modulated."
+                }),
+                "blend_mode": (["adaptive", "fixed"], {
+                    "default": "adaptive",
+                    "tooltip": "Blending mode. 'adaptive': modulate blend strength by confidence and motion (v0.8+, recommended). 'fixed': use constant blend_strength (legacy)."
+                }),
+                "scene_cut_detection": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Detect and handle scene cuts to prevent cross-scene blending (v0.8+). Recommended: True."
+                }),
+                "scene_cut_threshold": ("FLOAT", {
+                    "default": 0.3,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Histogram correlation threshold for scene cut detection. Lower values (0.2) detect more cuts, higher values (0.4) are more conservative. 0.3 is recommended."
+                }),
+                "motion_threshold": ("FLOAT", {
+                    "default": 20.0,
+                    "min": 5.0,
+                    "max": 100.0,
+                    "step": 5.0,
+                    "tooltip": "Flow magnitude (pixels) above which blending is reduced to prevent ghosting. 20 is recommended for most cases."
+                }),
+            },
+            "optional": {
+                "confidence": ("IMAGE", {
+                    "tooltip": "Optional flow confidence from RAFTFlowExtractor. Used in adaptive mode to blend more in uncertain regions. If not provided, uses motion magnitude only."
                 }),
             }
         }
@@ -307,13 +467,20 @@ class TemporalConsistency:
     FUNCTION = "stabilize"
     CATEGORY = "MotionTransfer/Temporal"
 
-    def stabilize(self, frames, flow, blend_strength):
-        """Apply temporal blending for flicker reduction.
+    def stabilize(self, frames, flow, blend_strength, blend_mode="adaptive",
+                  scene_cut_detection=True, scene_cut_threshold=0.3,
+                  motion_threshold=20.0, confidence=None):
+        """Apply temporal blending for flicker reduction with adaptive blending.
 
         Args:
             frames: [B, H, W, C] frame sequence
             flow: [B-1, H, W, 2] forward flow fields between consecutive frames
-            blend_strength: Blending weight for previous frame [0=none, 1=full]
+            blend_strength: Base blending weight for previous frame [0=none, 1=full]
+            blend_mode: 'adaptive' or 'fixed'
+            scene_cut_detection: Enable scene cut detection
+            scene_cut_threshold: Histogram correlation threshold for cuts
+            motion_threshold: Flow magnitude threshold for ghosting reduction
+            confidence: Optional [B-1, H, W, 1] confidence maps
 
         Returns:
             stabilized: [B, H, W, C] temporally stabilized frames
@@ -322,6 +489,8 @@ class TemporalConsistency:
             frames = frames.cpu().numpy()
         if isinstance(flow, torch.Tensor):
             flow = flow.cpu().numpy()
+        if confidence is not None and isinstance(confidence, torch.Tensor):
+            confidence = confidence.cpu().numpy()
 
         batch_size = frames.shape[0]
         flow_count = flow.shape[0]
@@ -339,10 +508,27 @@ class TemporalConsistency:
 
         for t in range(1, batch_size):
             current_frame = frames[t]
+            prev_frame = frames[t-1]
             prev_stabilized = stabilized[-1]
-            # Flow index: flow[0] is frame0→frame1, flow[1] is frame1→frame2, etc.
-            # For frame t, we need flow from frame(t-1) to frame(t), which is flow[t-1]
             flow_fwd = flow[t-1]  # Forward flow from t-1 to t
+
+            # Scene cut detection
+            if scene_cut_detection and self._detect_scene_cut(prev_frame, current_frame, scene_cut_threshold):
+                # Scene cut detected - no blending
+                print(f"[TemporalConsistency] Scene cut detected at frame {t}, skipping blend")
+                stabilized.append(current_frame)
+                continue
+
+            # Compute adaptive blend strength
+            if blend_mode == "adaptive":
+                # Get per-pixel blend strength based on motion and confidence
+                conf_map = confidence[t-1] if confidence is not None else None
+                blend_weight = self._compute_adaptive_blend(
+                    flow_fwd, conf_map, blend_strength, motion_threshold
+                )
+            else:
+                # Fixed blend strength
+                blend_weight = blend_strength
 
             # To warp previous frame forward, we need inverse mapping
             # Forward flow tells us where pixels move TO, but remap needs where to sample FROM
@@ -358,16 +544,92 @@ class TemporalConsistency:
             )
 
             # Blend current with warped previous
-            blended = cv2.addWeighted(
-                current_frame.astype(np.float32), 1.0 - blend_strength,
-                warped_prev.astype(np.float32), blend_strength,
-                0
-            )
+            if isinstance(blend_weight, np.ndarray):
+                # Per-pixel adaptive blending
+                blend_weight = blend_weight[:, :, np.newaxis]  # Add channel dimension
+                blended = (current_frame.astype(np.float32) * (1.0 - blend_weight) +
+                          warped_prev.astype(np.float32) * blend_weight)
+            else:
+                # Uniform blending
+                blended = cv2.addWeighted(
+                    current_frame.astype(np.float32), 1.0 - blend_weight,
+                    warped_prev.astype(np.float32), blend_weight,
+                    0
+                )
 
             stabilized.append(blended.astype(np.float32))
 
         result = np.stack(stabilized, axis=0)
         return (result,)
+
+    def _detect_scene_cut(self, frame_a, frame_b, threshold=0.3):
+        """Detect scene cut between consecutive frames using histogram correlation.
+
+        Args:
+            frame_a: [H, W, C] first frame
+            frame_b: [H, W, C] second frame
+            threshold: Correlation threshold (lower = more sensitive)
+
+        Returns:
+            True if scene cut detected, False otherwise
+        """
+        # Convert to 8-bit for histogram
+        frame_a_8bit = (np.clip(frame_a, 0, 1) * 255).astype(np.uint8)
+        frame_b_8bit = (np.clip(frame_b, 0, 1) * 255).astype(np.uint8)
+
+        # Compute color histograms
+        hist_a = cv2.calcHist([frame_a_8bit], [0, 1, 2], None,
+                             [32, 32, 32], [0, 256, 0, 256, 0, 256])
+        hist_b = cv2.calcHist([frame_b_8bit], [0, 1, 2], None,
+                             [32, 32, 32], [0, 256, 0, 256, 0, 256])
+
+        # Normalize and compare
+        hist_a = cv2.normalize(hist_a, hist_a).flatten()
+        hist_b = cv2.normalize(hist_b, hist_b).flatten()
+
+        # Compute correlation
+        correlation = cv2.compareHist(
+            hist_a.astype(np.float32),
+            hist_b.astype(np.float32),
+            cv2.HISTCMP_CORREL
+        )
+
+        return correlation < threshold
+
+    def _compute_adaptive_blend(self, flow, confidence, base_strength, motion_threshold):
+        """Compute per-pixel adaptive blend strength.
+
+        Args:
+            flow: [H, W, 2] optical flow
+            confidence: [H, W, 1] flow confidence (optional)
+            base_strength: Base blend strength
+            motion_threshold: Flow magnitude threshold
+
+        Returns:
+            [H, W] per-pixel blend strength
+        """
+        h, w = flow.shape[:2]
+
+        # Compute flow magnitude
+        flow_mag = np.sqrt(flow[:, :, 0]**2 + flow[:, :, 1]**2)
+
+        # Motion factor: reduce blending for fast motion to prevent ghosting
+        # 1.0 for static, 0.0 for motion > threshold
+        motion_factor = np.clip(1.0 - flow_mag / motion_threshold, 0, 1)
+
+        # Confidence factor: blend more in uncertain regions
+        if confidence is not None:
+            # Low confidence = more blending (temporal averaging helps)
+            conf_squeeze = confidence[:, :, 0] if confidence.shape[2] == 1 else confidence[:, :, 0]
+            conf_factor = base_strength + (1 - conf_squeeze) * (1 - base_strength) * 0.5
+        else:
+            conf_factor = base_strength
+
+        # Combined: reduce blending for fast, confident motion
+        # Increase blending for slow, uncertain motion
+        blend_strength = conf_factor * motion_factor
+
+        return blend_strength
 
 
 # ------------------------------------------------------

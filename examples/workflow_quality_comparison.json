@@ -1,0 +1,247 @@
+{
+  "workflow_name": "Quality Comparison: v0.7 Legacy vs v0.8 Quality Mode",
+  "description": "Side-by-side comparison workflow showing legacy (v0.7) settings vs new v0.8 quality improvements. Process same input with both settings to see the difference.",
+  "version": "0.8.0",
+  "note": "This workflow creates TWO output sequences for A/B comparison",
+  "shared_nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "title": "Load Low-Res Video (Shared)",
+      "params": {
+        "video_path": "input/ai_video_1080p.mp4"
+      },
+      "outputs": {
+        "images": "video_frames"
+      }
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "title": "Load High-Res Still (Shared)",
+      "params": {
+        "image_path": "input/still_16k.png"
+      },
+      "outputs": {
+        "image": "still_hires"
+      }
+    },
+    {
+      "id": 3,
+      "type": "RAFTFlowExtractor",
+      "title": "Extract Flow (Shared)",
+      "params": {
+        "model_name": "sea-raft-medium",
+        "raft_iters": 8
+      },
+      "inputs": {
+        "images": "video_frames"
+      },
+      "outputs": {
+        "flow": "flow_lowres",
+        "confidence": "flow_confidence"
+      }
+    }
+  ],
+  "legacy_v07_branch": [
+    {
+      "id": 10,
+      "type": "FlowSRRefine",
+      "title": "Legacy Flow Upscale (v0.7)",
+      "params": {
+        "target_width": 15360,
+        "target_height": 8640,
+        "upscale_method": "guided_filter",
+        "edge_detection": "none",
+        "guided_filter_radius": 8,
+        "guided_filter_eps": 0.001
+      },
+      "inputs": {
+        "flow": "flow_lowres",
+        "guide_image": "still_hires"
+      },
+      "outputs": {
+        "flow_upscaled": "flow_hires_legacy"
+      },
+      "note": "Legacy mode: guided filter without edge detection → flow bleeds across edges"
+    },
+    {
+      "id": 11,
+      "type": "FlowToSTMap",
+      "title": "Convert to STMap (Legacy)",
+      "params": {},
+      "inputs": {
+        "flow": "flow_hires_legacy"
+      },
+      "outputs": {
+        "stmap": "stmap_legacy"
+      }
+    },
+    {
+      "id": 12,
+      "type": "TileWarp16K",
+      "title": "Legacy Tile Warp (v0.7)",
+      "params": {
+        "tile_size": 2048,
+        "overlap": 128,
+        "interpolation": "cubic",
+        "blend_mode": "linear",
+        "color_match": false
+      },
+      "inputs": {
+        "still_image": "still_hires",
+        "stmap": "stmap_legacy"
+      },
+      "outputs": {
+        "warped_sequence": "warped_legacy"
+      },
+      "note": "Legacy mode: linear blending → visible seams, no color matching → exposure discontinuities"
+    },
+    {
+      "id": 13,
+      "type": "TemporalConsistency",
+      "title": "Legacy Temporal (v0.7)",
+      "params": {
+        "blend_strength": 0.3,
+        "blend_mode": "fixed",
+        "scene_cut_detection": false
+      },
+      "inputs": {
+        "frames": "warped_legacy",
+        "flow": "flow_hires_legacy"
+      },
+      "outputs": {
+        "stabilized": "final_legacy"
+      },
+      "note": "Legacy mode: fixed blend → ghosting in fast motion, flicker in slow motion, blends across scene cuts"
+    },
+    {
+      "id": 14,
+      "type": "HiResWriter",
+      "title": "Export Legacy Output",
+      "params": {
+        "output_path": "output/comparison/legacy_v07/frame",
+        "format": "png",
+        "start_frame": 0
+      },
+      "inputs": {
+        "images": "final_legacy"
+      }
+    }
+  ],
+  "quality_v08_branch": [
+    {
+      "id": 20,
+      "type": "FlowSRRefine",
+      "title": "Quality Flow Upscale (v0.8)",
+      "params": {
+        "target_width": 15360,
+        "target_height": 8640,
+        "upscale_method": "joint_bilateral",
+        "edge_detection": "canny",
+        "edge_threshold": 0.5,
+        "guided_filter_radius": 8,
+        "guided_filter_eps": 0.001
+      },
+      "inputs": {
+        "flow": "flow_lowres",
+        "guide_image": "still_hires"
+      },
+      "outputs": {
+        "flow_upscaled": "flow_hires_quality"
+      },
+      "note": "Quality mode: joint bilateral + Canny edges → no bleeding, sharp boundaries"
+    },
+    {
+      "id": 21,
+      "type": "FlowToSTMap",
+      "title": "Convert to STMap (Quality)",
+      "params": {},
+      "inputs": {
+        "flow": "flow_hires_quality"
+      },
+      "outputs": {
+        "stmap": "stmap_quality"
+      }
+    },
+    {
+      "id": 22,
+      "type": "TileWarp16K",
+      "title": "Quality Tile Warp (v0.8)",
+      "params": {
+        "tile_size": 2048,
+        "overlap": 128,
+        "interpolation": "cubic",
+        "blend_mode": "raised_cosine",
+        "color_match": true
+      },
+      "inputs": {
+        "still_image": "still_hires",
+        "stmap": "stmap_quality"
+      },
+      "outputs": {
+        "warped_sequence": "warped_quality"
+      },
+      "note": "Quality mode: raised cosine → seamless, color matching → uniform exposure"
+    },
+    {
+      "id": 23,
+      "type": "TemporalConsistency",
+      "title": "Quality Temporal (v0.8)",
+      "params": {
+        "blend_strength": 0.3,
+        "blend_mode": "adaptive",
+        "scene_cut_detection": true,
+        "scene_cut_threshold": 0.3,
+        "motion_threshold": 20.0
+      },
+      "inputs": {
+        "frames": "warped_quality",
+        "flow": "flow_hires_quality",
+        "confidence": "flow_confidence"
+      },
+      "outputs": {
+        "stabilized": "final_quality"
+      },
+      "note": "Quality mode: adaptive blend → no ghosting, scene cuts → clean transitions"
+    },
+    {
+      "id": 24,
+      "type": "HiResWriter",
+      "title": "Export Quality Output",
+      "params": {
+        "output_path": "output/comparison/quality_v08/frame",
+        "format": "png",
+        "start_frame": 0
+      },
+      "inputs": {
+        "images": "final_quality"
+      }
+    }
+  ],
+  "expected_quality_differences": {
+    "tile_seams": {
+      "legacy_v07": "Visible linear gradient seams on uniform surfaces, especially sky/walls",
+      "quality_v08": "Completely invisible seams with raised cosine blending"
+    },
+    "color_discontinuities": {
+      "legacy_v07": "Exposure jumps at tile boundaries, especially with vignetting",
+      "quality_v08": "Seamless color matching, uniform appearance"
+    },
+    "edge_halos": {
+      "legacy_v07": "Halo artifacts around high-contrast edges (flow bleeding)",
+      "quality_v08": "Clean sharp edges with edge-aware refinement"
+    },
+    "temporal_artifacts": {
+      "legacy_v07": "Ghosting in fast motion, flicker in slow motion, blends across cuts",
+      "quality_v08": "Adaptive blending eliminates both, scene cuts handled correctly"
+    }
+  },
+  "inspection_tips": {
+    "tile_seams": "Look at uniform sky, walls, or gradients. Zoom to 100% and scrub through frames.",
+    "edge_halos": "Look at silhouettes against bright backgrounds (person vs sky). Check object boundaries.",
+    "temporal_flicker": "Play back at full speed. Legacy will flicker on slow motion, v0.8 should be smooth.",
+    "ghosting": "Check fast motion (hand wave, camera pan). Legacy shows double images, v0.8 should be clean.",
+    "scene_cuts": "If video has cuts, legacy will show blend artifacts across cut, v0.8 handles cleanly."
+  }
+}

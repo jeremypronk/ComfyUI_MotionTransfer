@@ -4,6 +4,80 @@ This folder contains example workflow JSON files for all three motion transfer p
 
 ---
 
+## 🎉 NEW in v0.8 - Quality Improvement Workflows
+
+**Recommended:** Start with these to get the best quality output!
+
+### 📁 `workflow_pipeline_a_quality_v08.json` ⭐ **HIGHLY RECOMMENDED**
+
+**Pipeline A with v0.8 Quality Improvements**
+
+**What's new:**
+- ✨ **Raised cosine tile blending** - Eliminates visible seams completely
+- ✨ **Color matching in tile overlaps** - Fixes exposure discontinuities
+- ✨ **Joint bilateral flow upsampling** - Prevents edge bleeding, preserves sharp boundaries
+- ✨ **Canny edge detection** - Explicit edge constraints for flow
+- ✨ **Adaptive temporal blending** - Motion-aware, confidence-weighted stabilization
+- ✨ **Scene cut detection** - Prevents blending across shot changes
+
+**Quality improvements you'll notice:**
+- No more visible seams at tile boundaries
+- Sharper edges around objects (no halos)
+- Smoother motion without ghosting
+- Better handling of fast motion
+- Cleaner transitions across scene cuts
+
+**Use this for:** Production work, best quality output
+
+---
+
+### 📁 `workflow_bidirectional_flow.json`
+
+**Advanced: Bidirectional Flow with Occlusion Detection**
+
+**What it does:**
+- Uses new `BidirectionalFlowExtractor` node (v0.8)
+- Computes forward AND backward flow
+- Checks forward-backward consistency
+- Detects occluded regions explicitly
+- Produces physics-based confidence maps (much better than heuristic)
+
+**Best for:**
+- Scenes with faces (eyes, mouth occlusions)
+- Hand motion (finger occlusions)
+- Overlapping objects
+- Complex organic motion
+- Any scene where standard confidence is unreliable
+
+**Processing time:** ~2x single-direction flow (runs flow twice)
+**Quality gain:** Significantly better confidence → less flicker in uncertain regions
+
+---
+
+### 📁 `workflow_quality_comparison.json`
+
+**Side-by-Side: v0.7 Legacy vs v0.8 Quality**
+
+**What it does:**
+- Processes same input with BOTH settings
+- Creates two output sequences for A/B testing
+- Legacy branch uses v0.7 settings (linear blending, guided filter, fixed temporal)
+- Quality branch uses v0.8 settings (all improvements enabled)
+
+**Use this to:**
+- See exactly what each improvement does
+- Convince yourself the quality gains are worth it
+- Understand the difference between modes
+- Inspect tile seams, edge halos, temporal artifacts side-by-side
+
+**Expected differences:**
+- **Tile seams:** Legacy shows gradients on uniform surfaces, v0.8 seamless
+- **Edge halos:** Legacy shows bleeding around objects, v0.8 clean
+- **Temporal flicker:** Legacy flickers on slow motion, v0.8 smooth
+- **Ghosting:** Legacy shows double images in fast motion, v0.8 clean
+
+---
+
 ## Quick Start
 
 1. **Open ComfyUI**
