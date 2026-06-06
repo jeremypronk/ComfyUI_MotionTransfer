@@ -91,17 +91,12 @@ class OpticalFlowModel:
         """Get list of all available model names.
 
         Returns:
-            Dictionary with 'raft' and 'searaft' model lists
+            List of available model names
 
         Example:
             >>> models = OpticalFlowModel.get_available_models()
-            >>> print(models['searaft'])
-            ['sea-raft-small', 'sea-raft-medium', 'sea-raft-large']
         """
-        return {
-            'raft': ['raft-things', 'raft-sintel', 'raft-small'],
-            'searaft': ['sea-raft-small', 'sea-raft-medium', 'sea-raft-large']
-        }
+        return ['raft-things', 'raft-sintel', 'raft-small'] + searaft_loader.AVAILABLE_MODELS
 
     @staticmethod
     def clear_cache():

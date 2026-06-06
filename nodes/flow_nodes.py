@@ -19,6 +19,31 @@ from ..utils.logger import get_logger
 logger = get_logger()
 
 
+def run_flow_model(model, img1, img2, iters=12, test_mode=True, **kwargs):
+    """
+    Wrapper to safely execute optical flow models and standardize the output.
+    Converts SEA-RAFT's dictionary output into a standard (flow_low, flow, uncertainty) tuple.
+    """
+    output = model(img1, img2, iters=iters, test_mode=test_mode, **kwargs)
+
+    # Handle SEA-RAFT (returns a dictionary)
+    if isinstance(output, dict):
+        flow_low = output['flow'][0]  # First iteration (low res)
+        flow_final = output['flow'][-1]  # Final iteration (high res)
+        uncertainty = output['info'][-1] if 'info' in output else None
+        return flow_low, flow_final, uncertainty
+
+    # Handle standard RAFT / other models (returns a tuple or list)
+    elif isinstance(output, (tuple, list)):
+        if len(output) >= 3:
+            return output[0], output[1], output[2]
+        elif len(output) == 2:  # Some RAFTs don't return uncertainty
+            return output[0], output[1], None
+
+    # Fallback
+    return output
+
+
 class RAFTFlowExtractor:
     """Extract dense optical flow between consecutive frames using RAFT or SEA-RAFT.
 
@@ -38,21 +63,14 @@ class RAFTFlowExtractor:
                     "tooltip": "Video frames from ComfyUI video loader. Expects [B, H, W, C] batch of images."
                 }),
                 "raft_iters": ("INT", {
-                    "default": 12,
+                    "default": 8,
                     "min": 6,
                     "max": 32,
                     "tooltip": "Refinement iterations. SEA-RAFT needs fewer (6-8) than RAFT (12-20) for same quality. Will auto-adjust to 8 for SEA-RAFT if you leave at default 12."
                 }),
-                "model_name": ([
-                    "raft-sintel",
-                    "raft-things",
-                    "raft-small",
-                    "sea-raft-small",
-                    "sea-raft-medium",
-                    "sea-raft-large"
-                ], {
-                    "default": "raft-sintel",
-                    "tooltip": "Optical flow model. RAFT: original (2020), requires manual model download. SEA-RAFT: newer (ECCV 2024), 2.3x faster with 22% better accuracy, auto-downloads from HuggingFace. Recommended: sea-raft-medium for best speed/quality balance."
+                "model_name": (OpticalFlowModel.get_available_models(), {
+                    "default": OpticalFlowModel.get_available_models()[1],
+                    "tooltip": "Optical flow model. "
                 }),
                 "handle_large_motion": ("BOOLEAN", {
                     "default": False,
@@ -92,9 +110,8 @@ class RAFTFlowExtractor:
         model, model_type = self._load_model(model_name, device)
 
         # Auto-adjust iterations for SEA-RAFT if user left default
-        if model_type == 'searaft' and raft_iters == 12:
-            raft_iters = 8
-            print(f"[Motion Transfer] Auto-adjusted iterations to {raft_iters} for SEA-RAFT (faster convergence)")
+        if model_type == 'searaft' and raft_iters > 8:
+            print(f"[Motion Transfer] **** WARNING recommended raft_iters is 8 for SEA-RAFT (faster convergence) you are using {raft_iters}!! ****")
 
         # Convert ComfyUI format [B, H, W, C] to torch [B, C, H, W]
         if isinstance(images, np.ndarray):
@@ -120,13 +137,7 @@ class RAFTFlowExtractor:
                     img2 = pad(img2, (0, pad_w, 0, pad_h), mode='replicate')
 
                 # Run model (RAFT or SEA-RAFT)
-                if model_type == 'searaft':
-                    # SEA-RAFT returns uncertainty as third output
-                    flow_low, flow_up, uncertainty = model(img1, img2, iters=raft_iters, test_mode=True)
-                else:
-                    # Original RAFT returns only flow
-                    flow_low, flow_up = model(img1, img2, iters=raft_iters, test_mode=True)
-                    uncertainty = None
+                flow_low, flow_up, uncertainty = run_flow_model(model, img1, img2, iters=raft_iters, test_mode=True)
 
                 # Remove padding
                 if pad_h > 0 or pad_w > 0:
@@ -211,10 +222,7 @@ class RAFTFlowExtractor:
         # Estimate required subdivisions
         with torch.no_grad():
             # Quick initial flow estimate with few iterations
-            if model_type == 'searaft':
-                _, initial_flow, _ = model(frame_a * 255.0, frame_b * 255.0, iters=4, test_mode=True)
-            else:
-                _, initial_flow = model(frame_a * 255.0, frame_b * 255.0, iters=4, test_mode=True)
+            _, initial_flow, _ = run_flow_model(model, frame_a * 255.0, frame_b * 255.0, iters=4, test_mode=True)
 
             max_motion = torch.sqrt(initial_flow[:, 0:1]**2 + initial_flow[:, 1:2]**2).max().item()
             n_subdivisions = int(np.ceil(max_motion / max_displacement))
@@ -243,11 +251,7 @@ class RAFTFlowExtractor:
                     img2 = pad(img2, (0, pad_w, 0, pad_h), mode='replicate')
 
                 # Compute flow
-                if model_type == 'searaft':
-                    _, flow_up, uncertainty = model(img1, img2, iters=raft_iters, test_mode=True)
-                else:
-                    _, flow_up = model(img1, img2, iters=raft_iters, test_mode=True)
-                    uncertainty = None
+                _, flow_up, uncertainty = run_flow_model(model, img1, img2, iters=raft_iters, test_mode=True)
 
                 # Remove padding
                 if pad_h > 0 or pad_w > 0:
@@ -386,16 +390,9 @@ class BidirectionalFlowExtractor:
                     "max": 32,
                     "tooltip": "Refinement iterations. SEA-RAFT needs fewer (6-8) than RAFT (12-20) for same quality."
                 }),
-                "model_name": ([
-                    "raft-sintel",
-                    "raft-things",
-                    "raft-small",
-                    "sea-raft-small",
-                    "sea-raft-medium",
-                    "sea-raft-large"
-                ], {
-                    "default": "sea-raft-medium",
-                    "tooltip": "Optical flow model. Recommended: sea-raft-medium for best speed/quality balance."
+                "model_name": (OpticalFlowModel.get_available_models(), {
+                    "default": OpticalFlowModel.get_available_models()[1],
+                    "tooltip": "Optical flow model. "
                 }),
                 "consistency_threshold": ("FLOAT", {
                     "default": 1.0,
@@ -464,18 +461,10 @@ class BidirectionalFlowExtractor:
                     img2 = pad(img2, (0, pad_w, 0, pad_h), mode='replicate')
 
                 # Forward flow (img1 → img2)
-                if model_type == 'searaft':
-                    flow_low_fwd, flow_fwd, uncertainty_fwd = model(img1, img2, iters=raft_iters, test_mode=True)
-                else:
-                    flow_low_fwd, flow_fwd = model(img1, img2, iters=raft_iters, test_mode=True)
-                    uncertainty_fwd = None
+                flow_low_fwd, flow_fwd, uncertainty_fwd = run_flow_model(model, img1, img2, iters=raft_iters, test_mode=True)
 
                 # Backward flow (img2 → img1)
-                if model_type == 'searaft':
-                    flow_low_bwd, flow_bwd, uncertainty_bwd = model(img2, img1, iters=raft_iters, test_mode=True)
-                else:
-                    flow_low_bwd, flow_bwd = model(img2, img1, iters=raft_iters, test_mode=True)
-                    uncertainty_bwd = None
+                flow_low_bwd, flow_bwd, uncertainty_bwd = run_flow_model(model, img2, img1, iters=raft_iters, test_mode=True)
 
                 # Remove padding
                 if pad_h > 0 or pad_w > 0:
