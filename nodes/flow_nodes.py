@@ -116,7 +116,7 @@ class RAFTFlowExtractor:
         # Convert ComfyUI format [B, H, W, C] to torch [B, C, H, W]
         if isinstance(images, np.ndarray):
             images = torch.from_numpy(images)
-        images = images.permute(0, 3, 1, 2).to(device)
+        images = images.permute(0, 3, 1, 2).to(device=device, dtype=torch.float32)
 
         # Extract flow for consecutive pairs
         flows = []
@@ -437,7 +437,7 @@ class BidirectionalFlowExtractor:
         # Convert ComfyUI format [B, H, W, C] to torch [B, C, H, W]
         if isinstance(images, np.ndarray):
             images = torch.from_numpy(images)
-        images = images.permute(0, 3, 1, 2).to(device)
+        images = images.permute(0, 3, 1, 2).to(device=device, dtype=torch.float32)
 
         # Extract bidirectional flow for consecutive pairs
         flows_fwd = []
